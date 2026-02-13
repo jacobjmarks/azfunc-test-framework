@@ -11,6 +11,10 @@ RUN curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor |
     sudo apt install -y azure-functions-core-tools-4
 
 FROM base AS final
-ENV FUNCTIONS_CORE_TOOLS_TELEMETRY_OPTOUT=1
+ENV FUNCTIONS_CORE_TOOLS_TELEMETRY_OPTOUT=1 \
+    FUNCTIONS_WORKER_RUNTIME=dotnet-isolated \
+    AzureWebJobsStorage=UseDevelopmentStorage=true \
+    AzureWebJobsScriptRoot=/app \
+    AzureFunctionsJobHost__Logging__Console__IsEnabled=true
 WORKDIR /app
-COPY --exclude=**/bin --exclude=**/obj . .
+COPY --exclude=**/bin --exclude=**/obj bin/out.linux-x64 .

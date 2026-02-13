@@ -1,17 +1,24 @@
-﻿using System.Security.Cryptography;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using DotNet.Testcontainers;
 using DotNet.Testcontainers.Builders;
-using DotNet.Testcontainers.Containers;
 using DotNet.Testcontainers.Images;
+using IContainer = DotNet.Testcontainers.Containers.IContainer;
 
 namespace src;
 
 public class FuncAppFactory : IAsyncDisposable
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> s_dotnetBuildLocks = new();
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> s_imageBuildLocks = new();
+    private static readonly ConcurrentDictionary<string, IFutureDockerImage> s_imageCache = new();
+
+    private static readonly CommonDirectoryPath s_projectDirectory = CommonDirectoryPath.GetProjectDirectory();
+    private readonly DirectoryInfo _funcAppDirectory;
     private readonly IFutureDockerImage _image;
     private readonly IContainer _container;
     private readonly int _internalPort = 7071;
-    private int _hostPort;
+    private int? _hostPort = null;
 
     static FuncAppFactory()
     {
@@ -20,22 +27,17 @@ public class FuncAppFactory : IAsyncDisposable
 
     public FuncAppFactory(string relativeFuncAppDirectory)
     {
-        var projectDirectory = CommonDirectoryPath.GetProjectDirectory();
-        var funcAppDirectory = new DirectoryInfo(Path.Combine(projectDirectory.DirectoryPath, relativeFuncAppDirectory));
-        if (!funcAppDirectory.Exists)
-            throw new ArgumentException($"The specified function app directory does not exist: {funcAppDirectory}", nameof(funcAppDirectory));
+        _funcAppDirectory = new DirectoryInfo(Path.Combine(s_projectDirectory.DirectoryPath, relativeFuncAppDirectory));
+        if (!_funcAppDirectory.Exists)
+            throw new ArgumentException($"The specified function app directory does not exist: {_funcAppDirectory}", nameof(_funcAppDirectory));
 
-        var funcAssemblyIdentifier = BitConverter.ToString(MD5.Create().ComputeHash(System.Text.Encoding.UTF8.GetBytes(funcAppDirectory.FullName))).Replace("-", "").ToLower();
-        var imageName = $"funcappfactory-{funcAssemblyIdentifier}";
-
-        _image = new ImageFromDockerfileBuilder()
-            .WithContextDirectory(funcAppDirectory.FullName)
-            .WithDockerfileDirectory(projectDirectory, string.Empty)
+        _image = s_imageCache.GetOrAdd(_funcAppDirectory.FullName, _ => new ImageFromDockerfileBuilder()
+            .WithContextDirectory(_funcAppDirectory.FullName)
+            .WithDockerfileDirectory(s_projectDirectory, string.Empty)
             .WithDockerfile("Dockerfile")
-            .WithName(imageName)
             .WithLogger(ConsoleLogger.Instance)
             .WithCleanUp(false)
-            .Build();
+            .Build());
 
         _container = new ContainerBuilder(_image)
             .WithPortBinding(_internalPort, assignRandomHostPort: true)
@@ -45,9 +47,67 @@ public class FuncAppFactory : IAsyncDisposable
             .Build();
     }
 
-    public async Task<FuncAppFactory> StartAsync(CancellationToken cancellationToken = default)
+    private async Task BuildFunctionAppAsync(CancellationToken cancellationToken = default)
     {
-        await _image.CreateAsync(cancellationToken).ConfigureAwait(false);
+        var semaphore = s_dotnetBuildLocks.GetOrAdd(_funcAppDirectory.FullName, _ => new SemaphoreSlim(1, 1));
+        await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo
+            {
+                WorkingDirectory = _funcAppDirectory.FullName,
+                FileName = "dotnet",
+                Arguments = "build -c Release -o bin/out.linux-x64 -r linux-x64",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            }) ?? throw new InvalidOperationException("Failed to start dotnet build process");
+
+            while (!process.HasExited)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (process.ExitCode != 0)
+            {
+                var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
+                throw new InvalidOperationException($"Failed to build project '{_funcAppDirectory.FullName}': {error}");
+            }
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    private async Task BuildDockerImageAsync(CancellationToken cancellationToken = default)
+    {
+        var semaphore = s_imageBuildLocks.GetOrAdd(_funcAppDirectory.FullName, _ => new SemaphoreSlim(1, 1));
+        await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            try
+            {
+                _ = _image.FullName;
+            }
+            catch (InvalidOperationException e) when (e.Message.Contains("Please create the resource"))
+            {
+                await _image.CreateAsync(cancellationToken);
+            }
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    public async Task<FuncAppFactory> BuildAndStartAsync(CancellationToken cancellationToken = default)
+    {
+        await BuildFunctionAppAsync(cancellationToken).ConfigureAwait(false);
+        await BuildDockerImageAsync(cancellationToken).ConfigureAwait(false);
         await _container.StartAsync(cancellationToken).ConfigureAwait(false);
         _hostPort = _container.GetMappedPublicPort(_internalPort);
         return this;
@@ -55,6 +115,9 @@ public class FuncAppFactory : IAsyncDisposable
 
     public HttpClient CreateClient()
     {
+        if (_hostPort == null)
+            throw new InvalidOperationException($"Container not started. Call {nameof(BuildAndStartAsync)} first.");
+
         return new HttpClient { BaseAddress = new Uri($"http://localhost:{_hostPort}") };
     }
 
