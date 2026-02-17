@@ -29,7 +29,7 @@ public class FuncAppFactory : IAsyncDisposable
     {
         _funcAppDirectory = new DirectoryInfo(Path.Combine(s_projectDirectory.DirectoryPath, relativeFuncAppDirectory));
         if (!_funcAppDirectory.Exists)
-            throw new ArgumentException($"The specified function app directory does not exist: {_funcAppDirectory}", nameof(_funcAppDirectory));
+            throw new ArgumentException($"The specified function app directory does not exist: {_funcAppDirectory}", nameof(relativeFuncAppDirectory));
 
         _image = s_imageCache.GetOrAdd(_funcAppDirectory.FullName, _ => new ImageFromDockerfileBuilder()
             .WithContextDirectory(_funcAppDirectory.FullName)
@@ -64,12 +64,8 @@ public class FuncAppFactory : IAsyncDisposable
                 CreateNoWindow = true,
             }) ?? throw new InvalidOperationException("Failed to start dotnet build process");
 
-            while (!process.HasExited)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
-            }
-
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            
             if (process.ExitCode != 0)
             {
                 var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);

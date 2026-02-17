@@ -18,7 +18,21 @@ public class FuncAppFactoryTests
     [Fact]
     public async Task EnsureBasicConcurrencySupport()
     {
-        var test = EnsureBasicFunctionality;
-        await Task.WhenAll(test(), test(), test());
+        async Task<Exception?> test()
+        {
+            try
+            {
+                await EnsureBasicFunctionality();
+                return null;
+            }
+            catch (Exception e)
+            {
+                return e;
+            }
+        }
+
+        var exceptions = await Task.WhenAll(test(), test(), test());
+
+        Assert.All(exceptions, Assert.Null);
     }
 }
