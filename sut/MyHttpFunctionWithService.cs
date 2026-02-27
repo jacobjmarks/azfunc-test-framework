@@ -5,19 +5,15 @@ using Microsoft.AspNetCore.Mvc;
 
 namespace sut;
 
-public class MyHttpFunction
+public class MyHttpFunctionWithService(ILogger<MyHttpFunctionWithService> logger, IExampleService service)
 {
-    private readonly ILogger<MyHttpFunction> _logger;
+    private readonly ILogger<MyHttpFunctionWithService> _logger = logger;
+    private readonly IExampleService _service = service;
 
-    public MyHttpFunction(ILogger<MyHttpFunction> logger)
-    {
-        _logger = logger;
-    }
-
-    [Function("MyHttpFunction")]
+    [Function("MyHttpFunctionWithService")]
     public IActionResult Run([HttpTrigger(AuthorizationLevel.Anonymous, "get", "post")] HttpRequest req)
     {
         _logger.LogInformation("C# HTTP trigger function processed a request.");
-        return new OkObjectResult("Welcome to Azure Functions!");
+        return new OkObjectResult(_service.GetMessage());
     }
 }

@@ -1,8 +1,14 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Reflection;
+
 using DotNet.Testcontainers;
 using DotNet.Testcontainers.Builders;
+using DotNet.Testcontainers.Configurations;
 using DotNet.Testcontainers.Images;
+
+using Microsoft.Azure.Functions.Worker.Builder;
+
 using IContainer = DotNet.Testcontainers.Containers.IContainer;
 
 namespace src;
@@ -16,9 +22,13 @@ public class FuncAppFactory : IAsyncDisposable
     private static readonly CommonDirectoryPath s_projectDirectory = CommonDirectoryPath.GetProjectDirectory();
     private readonly DirectoryInfo _funcAppDirectory;
     private readonly IFutureDockerImage _image;
-    private readonly IContainer _container;
+    private IContainer? _container = null;
     private readonly int _internalPort = 7071;
     private int? _hostPort = null;
+
+    private readonly string _instanceIdentifier = Guid.NewGuid().ToString().Split('-')[0];
+
+    private List<MethodInfo> _mutators = [];
 
     static FuncAppFactory()
     {
@@ -38,13 +48,12 @@ public class FuncAppFactory : IAsyncDisposable
             .WithLogger(ConsoleLogger.Instance)
             .WithCleanUp(false)
             .Build());
+    }
 
-        _container = new ContainerBuilder(_image)
-            .WithPortBinding(_internalPort, assignRandomHostPort: true)
-            .WithCommand("func", "start", "--verbose", "--port", _internalPort.ToString())
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilMessageIsLogged("Worker process started and initialized.|Now listening on: "))
-            .WithLogger(ConsoleLogger.Instance)
-            .Build();
+    public FuncAppFactory WithMutator(FuncAppMutator mutator)
+    {
+        _mutators.Add(mutator.GetMethodInfo());
+        return this;
     }
 
     private async Task BuildFunctionAppAsync(CancellationToken cancellationToken = default)
@@ -65,7 +74,7 @@ public class FuncAppFactory : IAsyncDisposable
             }) ?? throw new InvalidOperationException("Failed to start dotnet build process");
 
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            
+
             if (process.ExitCode != 0)
             {
                 var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
@@ -104,6 +113,19 @@ public class FuncAppFactory : IAsyncDisposable
     {
         await BuildFunctionAppAsync(cancellationToken).ConfigureAwait(false);
         await BuildDockerImageAsync(cancellationToken).ConfigureAwait(false);
+
+        var testAssembly = new FileInfo(_mutators[0].Module.Assembly.Location);
+
+        _container = new ContainerBuilder(_image)
+            .WithPortBinding(_internalPort, assignRandomHostPort: true)
+            .WithEnvironment("TAP", $"/tmp/{_instanceIdentifier}/{testAssembly.Name}")
+            .WithEnvironment("MUTATORS", string.Join(";", _mutators.Select(m => $"{m.DeclaringType!.FullName}.{m.Name}")))
+            .WithBindMount(testAssembly.DirectoryName, $"/tmp/{_instanceIdentifier}", AccessMode.ReadOnly)
+            .WithCommand("func", "start", "--port", _internalPort.ToString())
+            .WithWaitStrategy(Wait.ForUnixContainer().UntilMessageIsLogged("Worker process started and initialized.|Now listening on: "))
+            .WithLogger(ConsoleLogger.Instance)
+            .Build();
+
         await _container.StartAsync(cancellationToken).ConfigureAwait(false);
         _hostPort = _container.GetMappedPublicPort(_internalPort);
         return this;
@@ -119,6 +141,11 @@ public class FuncAppFactory : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        return _container.DisposeAsync();
+        GC.SuppressFinalize(this);
+        return _container != null
+            ? _container.DisposeAsync()
+            : ValueTask.CompletedTask;
     }
 }
+
+public delegate void FuncAppMutator(FunctionsApplicationBuilder builder);
