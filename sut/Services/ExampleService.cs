@@ -1,4 +1,4 @@
-namespace sut;
+namespace sut.Services;
 
 public interface IExampleService
 {
